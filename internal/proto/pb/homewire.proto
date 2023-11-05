@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+import "google/protobuf/any.proto";
+
+option go_package = "internal/proto/pb";
+
+message Envelope {
+  oneof Payload {
+    string ping = 1;
+    string pong = 2;
+    Introduction introduction = 3;
+    BasicWireInfo wireAnnouncement = 4;
+    WireList wireList = 5;
+    Message message = 6;
+  }
+}
+
+message Introduction {
+  string id = 1;
+  string displayedName = 2;
+  bytes publicKey = 3;
+}
+
+message BasicWireInfo {
+  string id = 1;
+  string name = 2;
+}
+
+message WireList {
+  repeated BasicWireInfo wires = 1;
+}
+
+message Message {
+  string text = 1;
+
+  enum AttachmentType {
+    IMAGE = 0;
+    VIDEO = 1;
+    AUDIO = 2;
+  }
+
+  message Attachment {
+    AttachmentType type = 1;
+    google.protobuf.Any data = 2;
+  }
+
+  optional Attachment attachment = 2;
+}
