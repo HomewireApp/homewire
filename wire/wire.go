@@ -2,6 +2,7 @@ package wire
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -57,6 +58,12 @@ type Wire struct {
 	joinStatusChangedHandlers       []OnJoinStatusChangedHandler
 	connectionStatusChangedHandlers []OnConnectionStatusChangedHandler
 	mutHooks                        *sync.Mutex
+}
+
+type WireOtp struct {
+	Code      string
+	Ttl       uint64
+	ExpiresAt time.Time
 }
 
 func (w *Wire) ensureConnected() {
@@ -176,13 +183,15 @@ func CreateNewKnownWire(ctx *ctx.Context, name string) (*Wire, error) {
 		return nil, tracerr.Wrap(err)
 	}
 
-	key, secret, err := utils.GenerateNewOtp(name)
+	id := utils.NewUUID()
+
+	key, secret, err := utils.GenerateNewOtp(fmt.Sprintf("w:%s", id))
 	if err != nil {
 		return nil, tracerr.Wrap(err)
 	}
 
 	wireModel := &database.WireModel{
-		Id:         utils.NewUUID(),
+		Id:         id,
 		Name:       name,
 		PrivateKey: prvBytes,
 		OtpSecret:  secret,
@@ -194,7 +203,7 @@ func CreateNewKnownWire(ctx *ctx.Context, name string) (*Wire, error) {
 
 	w := &Wire{
 		ctx:              ctx,
-		Id:               wireModel.Id,
+		Id:               id,
 		Name:             name,
 		JoinStatus:       Joining,
 		ConnectionStatus: NotConnected,
@@ -240,6 +249,32 @@ func (w *Wire) SendPlainMessage(msg Message) error {
 
 func (w *Wire) Join(otp string) error {
 	return errors.New("not yet implemented")
+}
+
+func (w *Wire) GenerateOtp() (*WireOtp, error) {
+	if w.JoinStatus != Joined || w.privKey == nil {
+		return nil, ErrWireNotJoined
+	}
+
+	if w.ConnectionStatus != Connected {
+		return nil, ErrWireNotConnected
+	}
+
+	privBytes, err := w.privKey.Raw()
+	if err != nil {
+		return nil, tracerr.Wrap(err)
+	}
+
+	code, ttl, err := utils.GenerateOtpCode(privBytes)
+	if err != nil {
+		return nil, tracerr.Wrap(err)
+	}
+
+	return &WireOtp{
+		Code:      code,
+		Ttl:       uint64(ttl),
+		ExpiresAt: time.Now().UTC().Add(time.Duration(int(ttl)) * time.Second),
+	}, nil
 }
 
 func (w *Wire) OnJoinStatusChanged(handler OnJoinStatusChangedHandler) {

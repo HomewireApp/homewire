@@ -12,6 +12,8 @@ import (
 	"github.com/ztrue/tracerr"
 )
 
+const DefaultOtpTtl uint = 60
+
 func NewUUID() string {
 	return uuid.NewString()
 }
@@ -51,6 +53,16 @@ func UnmarshalPublicKey(bytes []byte) (crypto.PubKey, error) {
 	return crypto.UnmarshalEd25519PublicKey(bytes)
 }
 
+func getOtpOptions(name string, secret []byte) totp.GenerateOpts {
+	return totp.GenerateOpts{
+		Issuer:      "homewire.app",
+		AccountName: name,
+		Secret:      secret,
+		Algorithm:   otp.AlgorithmSHA512,
+		Period:      DefaultOtpTtl,
+	}
+}
+
 func GenerateNewOtp(name string) (*otp.Key, []byte, error) {
 	secret := make([]byte, 64)
 	_, err := rand.Reader.Read(secret)
@@ -67,12 +79,25 @@ func GenerateNewOtp(name string) (*otp.Key, []byte, error) {
 }
 
 func GenerateOtpFromExistingSecret(name string, secret []byte) (*otp.Key, error) {
-	return totp.Generate(totp.GenerateOpts{
-		Issuer:      "homewire.app",
-		AccountName: name,
-		Secret:      secret,
-		Algorithm:   otp.AlgorithmSHA512,
+	return totp.Generate(getOtpOptions(name, secret))
+}
+
+func GenerateOtpCode(secret []byte) (string, uint, error) {
+	key, err := GenerateOtpFromExistingSecret("homewire", secret)
+	if err != nil {
+		return "", 0, err
+	}
+
+	code, err := totp.GenerateCodeCustom(key.Secret(), time.Now(), totp.ValidateOpts{
+		Period:    DefaultOtpTtl,
+		Algorithm: otp.AlgorithmSHA512,
 	})
+
+	if err != nil {
+		return "", 0, err
+	}
+
+	return code, DefaultOtpTtl, nil
 }
 
 type RetryAttemptsExhaustedError struct {
