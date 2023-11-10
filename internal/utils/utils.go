@@ -2,6 +2,7 @@ package utils
 
 import (
 	"crypto/rand"
+	"time"
 
 	petname "github.com/dustinkirkland/golang-petname"
 	"github.com/google/uuid"
@@ -72,4 +73,43 @@ func GenerateOtpFromExistingSecret(name string, secret []byte) (*otp.Key, error)
 		Secret:      secret,
 		Algorithm:   otp.AlgorithmSHA512,
 	})
+}
+
+type RetryAttemptsExhaustedError struct {
+	Attempts int
+	Errors   []error
+}
+
+func (r *RetryAttemptsExhaustedError) Error() string {
+	return "retry attempts have exhausted"
+}
+
+func Retry[T any](fn func() (T, error), maxAttempts int, delay time.Duration) (T, error) {
+	result, err := fn()
+
+	if err == nil {
+		return result, err
+	}
+
+	timer := time.NewTimer(delay)
+	errors := make([]error, 0, maxAttempts)
+
+	currentAttempt := 1
+	for {
+		<-timer.C
+		result, err := fn()
+
+		if err == nil {
+			timer.Stop()
+			return result, nil
+		}
+
+		errors = append(errors, err)
+
+		if currentAttempt >= maxAttempts {
+			return *new(T), tracerr.Wrap(&RetryAttemptsExhaustedError{Attempts: currentAttempt, Errors: errors})
+		}
+
+		timer.Reset(delay)
+	}
 }

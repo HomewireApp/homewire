@@ -5,10 +5,10 @@ import (
 	"database/sql"
 	"embed"
 
+	"github.com/HomewireApp/homewire/logger"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/ztrue/tracerr"
 
-	"github.com/HomewireApp/homewire/internal/logger"
 	"github.com/go-gorp/gorp"
 	migrate "github.com/rubenv/sql-migrate"
 )
@@ -17,13 +17,14 @@ import (
 var fsMigrations embed.FS
 
 type Database struct {
+	logger     logger.Logger
 	ctx        context.Context
 	connString string
 	db         *sql.DB
 	dbmap      *gorp.DbMap
 }
 
-func Open(path string) (*Database, error) {
+func Open(path string, logger logger.Logger) (*Database, error) {
 	db, err := sql.Open("sqlite3", path)
 
 	if err != nil {
@@ -36,6 +37,7 @@ func Open(path string) (*Database, error) {
 	dbmap.AddTableWithName(WireModel{}, "wires")
 
 	return &Database{
+		logger:     logger,
 		db:         db,
 		dbmap:      dbmap,
 		connString: "sqlite3://" + path,
@@ -54,7 +56,7 @@ func (db *Database) Migrate() error {
 		return err
 	}
 
-	logger.Debug("Successfully executed %v migrations", applied)
+	db.logger.Debug("Successfully executed %v migrations", applied)
 
 	return nil
 }

@@ -7,7 +7,6 @@ import (
 
 	ctx "github.com/HomewireApp/homewire/internal/context"
 	"github.com/HomewireApp/homewire/internal/database"
-	"github.com/HomewireApp/homewire/internal/logger"
 	"github.com/HomewireApp/homewire/internal/peer_discovery"
 	"github.com/HomewireApp/homewire/internal/proto"
 	"github.com/HomewireApp/homewire/internal/proto/pb"
@@ -33,33 +32,22 @@ type Homewire struct {
 	peerDiscovery *peer_discovery.PeerDiscovery
 
 	wires    map[string]*wire.Wire
-	mutWires *sync.Mutex
+	mutWires *sync.RWMutex
 
-	pubsub *pubsub.PubSub
-	topic  *pubsub.Topic
-	subs   *pubsub.Subscription
+	topic *pubsub.Topic
+	subs  *pubsub.Subscription
 
 	wireFoundHandlers []OnWireFoundHandler
-	mutHooks          *sync.Mutex
+	mutHooks          *sync.RWMutex
 }
 
-// Starts a new Homewire with the specified options. If options is nil, uses the default options
-func Open(opts *options.Options) (*Homewire, error) {
+func InitWithOptions(opts options.Options) (*Homewire, error) {
 	ctx := &ctx.Context{
 		Context: context.Background(),
+		Logger:  opts.Logger,
 	}
 
-	if opts == nil {
-		defaultOpts, err := options.Default()
-
-		if err != nil {
-			return nil, tracerr.Wrap(err)
-		}
-
-		opts = defaultOpts
-	}
-
-	db, err := database.Open(opts.DatabasePath)
+	db, err := database.Open(opts.DatabasePath, ctx.Logger)
 	if err != nil {
 		return nil, tracerr.Wrap(err)
 	}
@@ -93,7 +81,7 @@ func Open(opts *options.Options) (*Homewire, error) {
 	}
 	ctx.Host = host
 
-	pd, err := peer_discovery.Init(host, self)
+	pd, err := peer_discovery.Init(ctx, host, self)
 	if err != nil {
 		return nil, tracerr.Wrap(err)
 	}
@@ -107,6 +95,7 @@ func Open(opts *options.Options) (*Homewire, error) {
 	if err != nil {
 		return nil, tracerr.Wrap(err)
 	}
+	ctx.Pubsub = pubsub
 
 	topic, err := pubsub.Join(discoveryTopicName)
 	if err != nil {
@@ -132,25 +121,24 @@ func Open(opts *options.Options) (*Homewire, error) {
 	hw := &Homewire{
 		Context: ctx,
 
-		options:       opts,
+		options:       &opts,
 		db:            db,
 		self:          self,
 		peerDiscovery: pd,
 
 		wires:    wires,
-		mutWires: &sync.Mutex{},
-		pubsub:   pubsub,
+		mutWires: &sync.RWMutex{},
 		topic:    topic,
 		subs:     subs,
 
 		wireFoundHandlers: make([]OnWireFoundHandler, 0),
-		mutHooks:          &sync.Mutex{},
+		mutHooks:          &sync.RWMutex{},
 	}
 
 	go hw.wireDiscoveryLoop()
 
 	go func() {
-		wireInfo := make([]*pb.BasicWireInfo, len(knownWireModels))
+		wireInfo := make([]*pb.BasicWireInfo, 0, len(knownWireModels))
 		for _, m := range knownWireModels {
 			wireInfo = append(wireInfo, &pb.BasicWireInfo{
 				Id:   m.Id,
@@ -173,18 +161,18 @@ func Open(opts *options.Options) (*Homewire, error) {
 
 				bytes, err := proto.MarshalPlain(msg)
 				if err != nil {
-					logger.Warn("[homewire:open] Failed to marshal initial announcement message %v", err)
+					ctx.Logger.Warn("[homewire:open] Failed to marshal initial announcement message %v", err)
 					timer.Reset(3 * time.Second)
 					continue
 				}
 
 				if err := topic.Publish(hw.Context.Context, bytes); err != nil {
-					logger.Warn("[homewire:open] Failed to publish initial announcement message %v", err)
+					ctx.Logger.Warn("[homewire:open] Failed to publish initial announcement message %v", err)
 					timer.Reset(3 * time.Second)
 					continue
 				}
 
-				logger.Debug("[homewire:open] Successfully announced %v initial wires", len(wireInfo))
+				ctx.Logger.Debug("[homewire:open] Successfully announced %v initial wires", len(wireInfo))
 			}
 		}()
 	}()
@@ -192,58 +180,154 @@ func Open(opts *options.Options) (*Homewire, error) {
 	return hw, nil
 }
 
+// Initializes homewire with the default options
+func Init() (*Homewire, error) {
+	opts, err := options.Default()
+	if err != nil {
+		return nil, tracerr.Wrap(err)
+	}
+
+	return InitWithOptions(*opts)
+}
+
 func (hw *Homewire) wireDiscoveryLoop() {
 	for {
-		msgBytes, err := hw.subs.Next(hw.Context.Context)
+		msg, err := hw.subs.Next(hw.Context.Context)
+
+		if msg.ReceivedFrom == hw.Context.Host.Network().LocalPeer() {
+			continue
+		}
 
 		if err != nil {
-			logger.Warn("[homewire:wireDiscoveryLoop] Failed to read next message from subscription")
+			hw.Context.Logger.Warn("[homewire:wireDiscoveryLoop] Failed to read next message from subscription")
 			continue
 		}
 
-		env, err := proto.UnmarshalPlainEnvelope(msgBytes.Data)
+		env, err := proto.UnmarshalPlainEnvelope(msg.Data)
 		if err != nil {
-			logger.Warn("[homewire:wireDiscoveryLoop] Failed to unmarshal incoming message")
+			hw.Context.Logger.Warn("[homewire:wireDiscoveryLoop] Failed to unmarshal incoming message")
 			continue
 		}
 
-		ann := env.GetWireAnnouncement()
-		if ann == nil {
-			logger.Warn("[homewire:wireDiscoveryLoop] Unexpected message received from wire: %v", ann)
+		if wireList := env.GetWireList(); wireList != nil {
+			hw.mutWires.Lock()
+
+			received := 0
+			saved := 0
+
+			for _, w := range wireList.Wires {
+				received += 1
+
+				if hw.wires[w.Id] == nil {
+					w := wire.CreateUnknownWire(hw.Context, w.Id, w.Name)
+					hw.wires[w.Id] = w
+					go hw.afterWireFound(w)
+
+					saved += 1
+				}
+			}
+
+			hw.Context.Logger.Debug("[homewire:wireDiscoveryLoop] Received %v wires and saved %v of them", received, saved)
+
+			hw.mutWires.Unlock()
+		} else if ann := env.GetWireAnnouncement(); ann != nil {
+			hw.mutWires.Lock()
+
+			saved := false
+
+			if hw.wires[ann.Id] == nil {
+				w := wire.CreateUnknownWire(hw.Context, ann.Id, ann.Name)
+				hw.wires[ann.Id] = w
+				go hw.afterWireFound(w)
+
+				saved = true
+			}
+
+			hw.Context.Logger.Debug("[homewire:wireDiscoveryLoop] Received announcement for new wire %v (saved? %v)", ann.Id, saved)
+
+			hw.mutWires.Unlock()
+		} else {
+			hw.Context.Logger.Warn("[homewire:wireDiscoveryLoop] Unexpected message received from wire: %v", env)
 			continue
 		}
-
-		hw.mutWires.Lock()
-
-		if hw.wires[ann.Id] == nil {
-			w := wire.CreateUnknownWire(hw.Context, ann.Id, ann.Name)
-			hw.wires[ann.Id] = w
-			go hw.triggerOnWireFound(w)
-		}
-
-		hw.mutWires.Unlock()
 	}
 }
 
-func (hw *Homewire) triggerOnWireFound(w *wire.Wire) {
-	hw.mutHooks.Lock()
-	defer hw.mutHooks.Unlock()
+func (hw *Homewire) afterWireFound(w *wire.Wire) {
+	hw.mutHooks.RLock()
+	defer hw.mutHooks.RUnlock()
 	for _, handler := range hw.wireFoundHandlers {
 		go handler(w)
 	}
 }
 
-func (hw *Homewire) CreateNewWire(name string) (*wire.Wire, error) {
-	return wire.CreateNewKnownWire(hw.Context, name)
+func (hw *Homewire) announceWireWhenConnected(w *wire.Wire) {
+	timer := time.NewTimer(200 * time.Millisecond)
+	retryInterval := 1 * time.Second
+
+	for {
+		<-timer.C
+
+		if w.ConnectionStatus != wire.Connected {
+			timer.Reset(retryInterval)
+			continue
+		}
+
+		msg := &pb.Envelope{
+			Payload: &pb.Envelope_WireAnnouncement{
+				WireAnnouncement: &pb.BasicWireInfo{
+					Id:   w.Id,
+					Name: w.Name,
+				},
+			},
+		}
+
+		bytes, err := proto.MarshalPlain(msg)
+		if err != nil {
+			hw.Context.Logger.Debug("[homewire:announceWireWhenConnected] Failed to announce wire due to marshalling error, will retry later %v", err)
+			timer.Reset(retryInterval)
+			continue
+		}
+
+		if err := hw.topic.Publish(context.Background(), bytes); err != nil {
+			hw.Context.Logger.Debug("[homewire:announceWireWhenConnected] Failed to announce wire due to message publishing error, will retry later %v", err)
+			timer.Reset(retryInterval)
+			continue
+		}
+
+		hw.Context.Logger.Debug("[homewire:announceWireWhenConnected] Successfully announced wire %v on topic %v", w.Id, hw.topic.String())
+		timer.Stop()
+	}
 }
 
-func (hw *Homewire) ListWires() []wire.Wire {
+func (hw *Homewire) CreateNewWire(name string) (*wire.Wire, error) {
+	w, err := wire.CreateNewKnownWire(hw.Context, name)
+
+	if err != nil {
+		return nil, err
+	}
+
 	hw.mutWires.Lock()
 	defer hw.mutWires.Unlock()
 
-	results := make([]wire.Wire, 0, len(hw.wires))
+	if hw.wires[w.Id] == nil {
+		hw.wires[w.Id] = w
+	}
+
+	go hw.afterWireFound(w)
+
+	go hw.announceWireWhenConnected(w)
+
+	return w, nil
+}
+
+func (hw *Homewire) ListWires() []*wire.Wire {
+	hw.mutWires.RLock()
+	defer hw.mutWires.RUnlock()
+
+	results := make([]*wire.Wire, 0, len(hw.wires))
 	for _, w := range hw.wires {
-		results = append(results, *w)
+		results = append(results, w)
 	}
 
 	return results

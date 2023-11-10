@@ -7,7 +7,6 @@ import (
 
 	ctx "github.com/HomewireApp/homewire/internal/context"
 	"github.com/HomewireApp/homewire/internal/database"
-	"github.com/HomewireApp/homewire/internal/logger"
 	"github.com/HomewireApp/homewire/internal/utils"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -51,7 +50,6 @@ type Wire struct {
 	privKey crypto.PrivKey
 	otpKey  *otp.Key
 
-	pubsub  *pubsub.PubSub
 	topic   *pubsub.Topic
 	subs    *pubsub.Subscription
 	mutConn *sync.Mutex
@@ -62,48 +60,44 @@ type Wire struct {
 }
 
 func (w *Wire) ensureConnected() {
-	ticker := time.NewTicker(3 * time.Second)
+	timer := time.NewTimer(0 * time.Millisecond)
+	retryInterval := 3 * time.Second
+
 	for {
-		<-ticker.C
+		<-timer.C
 
 		w.mutConn.Lock()
 		defer w.mutConn.Unlock()
 
 		w.setConnectionStatus(Connecting)
 
-		if w.pubsub != nil {
-			ticker.Stop()
+		if w.ctx.Pubsub == nil {
+			timer.Reset(retryInterval)
 			return
 		}
 
-		pubsub, err := pubsub.NewGossipSub(w.ctx.Context, w.ctx.Host)
+		topic, err := w.ctx.Pubsub.Join(w.getTopicName())
 		if err != nil {
-			logger.Warn("[wire:ensureConnected] [%v] Failed to set up pubsub, will retry later %v", w.Id, err)
+			w.ctx.Logger.Warn("[wire:ensureConnected] [%v] Failed to set up pubsub topic, will retry later %v", w.Id, err)
 			w.setConnectionStatus(ConnectionFailed)
-			continue
-		}
-
-		topic, err := pubsub.Join(w.getTopicName())
-		if err != nil {
-			logger.Warn("[wire:ensureConnected] [%v] Failed to set up pubsub topic, will retry later %v", w.Id, err)
-			w.setConnectionStatus(ConnectionFailed)
+			timer.Reset(retryInterval)
 			continue
 		}
 
 		subs, err := topic.Subscribe()
 		if err != nil {
 			topic.Close()
-			logger.Warn("[wire:ensureConnected] [%v] Failed to subscribe to topic, will retry later %v", w.Id, err)
+			w.ctx.Logger.Warn("[wire:ensureConnected] [%v] Failed to subscribe to topic, will retry later %v", w.Id, err)
 			w.setConnectionStatus(ConnectionFailed)
+			timer.Reset(retryInterval)
 			continue
 		}
 
-		w.pubsub = pubsub
 		w.topic = topic
 		w.subs = subs
 		w.setConnectionStatus(Connected)
-		ticker.Stop()
-		logger.Debug("[wire:ensureConnected] [%v] Successfully connected to wire", w.Id)
+		timer.Stop()
+		w.ctx.Logger.Debug("[wire:ensureConnected] [%v] Successfully connected to wire", w.Id)
 	}
 }
 
@@ -132,8 +126,8 @@ func (w *Wire) triggerJoinStatusChangedHandlers(new JoinStatus, old JoinStatus) 
 }
 
 func (w *Wire) triggerConnectionStatusChangedHandlers(new ConnectionStatus, old ConnectionStatus) {
-	w.mutHooks.Lock()
-	defer w.mutHooks.Unlock()
+	//w.mutHooks.Lock()
+	//defer w.mutHooks.Unlock()
 	for _, handler := range w.connectionStatusChangedHandlers {
 		go handler(new, old)
 	}
@@ -270,6 +264,4 @@ func (w *Wire) Destroy() {
 		w.topic.Close()
 		w.topic = nil
 	}
-
-	w.pubsub = nil
 }

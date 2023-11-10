@@ -1,10 +1,9 @@
 package peer_discovery
 
 import (
-	"context"
 	"time"
 
-	"github.com/HomewireApp/homewire/internal/logger"
+	"github.com/HomewireApp/homewire/internal/context"
 	"github.com/HomewireApp/homewire/internal/network"
 	"github.com/HomewireApp/homewire/internal/proto/messages"
 	"github.com/HomewireApp/homewire/peer"
@@ -22,7 +21,7 @@ type PeerDiscovery struct {
 	PeersFound chan *peer.Peer
 
 	self *peer.Self
-	ctx  context.Context
+	ctx  *context.Context
 	host host.Host
 
 	pendingIntroductions map[p2ppeer.ID]bool
@@ -35,11 +34,26 @@ type PeerDiscovery struct {
 	// svcCloseSignal chan bool
 }
 
-func Init(h host.Host, self *peer.Self) (*PeerDiscovery, error) {
+type discoveryNotifee struct {
+	host host.Host
+	pd   *PeerDiscovery
+}
+
+func (dn *discoveryNotifee) HandlePeerFound(pi p2ppeer.AddrInfo) {
+	if err := dn.pd.host.Connect(dn.pd.ctx.Context, pi); err != nil {
+		dn.pd.ctx.Logger.Debug("[discoveryNotifee:HandlePeerFound] Failed to dial peer %v due to %v", pi, err)
+		return
+	}
+
+	dn.pd.ctx.Logger.Debug("[discoveryNotifee:HandlePeerFound] Successfully connected to peer %v", pi.ID)
+	dn.pd.pendingIntroductions[pi.ID] = false
+}
+
+func Init(ctx *context.Context, h host.Host, self *peer.Self) (*PeerDiscovery, error) {
 	disc := &PeerDiscovery{
 		PeersFound:           make(chan *peer.Peer, 16),
 		self:                 self,
-		ctx:                  context.Background(),
+		ctx:                  ctx,
 		host:                 h,
 		pendingIntroductions: make(map[p2ppeer.ID]bool),
 		knownPeers:           make(map[p2ppeer.ID]*peer.Peer),
@@ -48,7 +62,8 @@ func Init(h host.Host, self *peer.Self) (*PeerDiscovery, error) {
 		// svcCloseSignal:       make(chan bool, 1),
 	}
 
-	svc := mdns.NewMdnsService(h, mdnsServiceTag, disc)
+	dn := &discoveryNotifee{pd: disc, host: h}
+	svc := mdns.NewMdnsService(h, mdnsServiceTag, dn)
 	if err := svc.Start(); err != nil {
 		return nil, tracerr.Wrap(err)
 	}
@@ -67,53 +82,42 @@ func Init(h host.Host, self *peer.Self) (*PeerDiscovery, error) {
 	return disc, nil
 }
 
-func (n *PeerDiscovery) HandlePeerFound(pi p2ppeer.AddrInfo) {
-	if err := n.host.Connect(n.ctx, pi); err != nil {
-		logger.Debug("Failed to dial peer %v due to %v", pi, err)
-		return
-	}
-
-	logger.Debug("Successfully connected to peer %v", pi.ID)
-	n.pendingIntroductions[pi.ID] = false
+func (pd *PeerDiscovery) GetKnownPeer(id p2ppeer.ID) *peer.Peer {
+	return pd.knownPeers[id]
 }
 
-func (d *PeerDiscovery) GetKnownPeer(id p2ppeer.ID) *peer.Peer {
-	return d.knownPeers[id]
-}
-
-func (d *PeerDiscovery) Destroy() {
-	d.introductionTicker.Stop()
+func (pd *PeerDiscovery) Destroy() {
+	pd.introductionTicker.Stop()
 	// d.destroySignal <- true
 	// <-d.svcCloseSignal
 }
 
-func (d *PeerDiscovery) introductionLoop() {
+func (pd *PeerDiscovery) introductionLoop() {
 	for {
-		<-d.introductionTicker.C
+		<-pd.introductionTicker.C
 
-		for pi, isPending := range d.pendingIntroductions {
+		for pi, isPending := range pd.pendingIntroductions {
 			if isPending {
 				continue
 			}
 
-			go d.introduceSelfToPeer(pi)
+			go pd.introduceSelfToPeer(pi)
 		}
 	}
 }
 
-func (d *PeerDiscovery) introduceSelfToPeer(pi p2ppeer.ID) {
-	conn := network.GetFirstConnectionToPeer(d.host, pi)
-
+func (pd *PeerDiscovery) introduceSelfToPeer(pi p2ppeer.ID) {
+	conn := network.GetFirstConnectionToPeer(pd.host, pi)
 	if conn == nil {
 		return
 	}
 
-	d.pendingIntroductions[pi] = true
+	pd.pendingIntroductions[pi] = true
 
-	envelope, err := messages.Introduction(d.self)
+	envelope, err := messages.Introduction(pd.self)
 	if err != nil {
-		logger.Warn("Failed to marshal identity message due to %v", err)
-		d.pendingIntroductions[pi] = true
+		pd.ctx.Logger.Warn("Failed to marshal identity message due to %v", err)
+		pd.pendingIntroductions[pi] = true
 		return
 	}
 
@@ -126,11 +130,11 @@ func (d *PeerDiscovery) introduceSelfToPeer(pi p2ppeer.ID) {
 
 	err = network.SendMessageToPeer(conn, msg)
 	if err != nil {
-		logger.Warn("Failed to send identity message to peer %v due to %v", pi, err)
-		d.pendingIntroductions[pi] = false
+		pd.ctx.Logger.Warn("Failed to send identity message to peer %v due to %v", pi, err)
+		pd.pendingIntroductions[pi] = false
 		return
 	}
 
-	logger.Info("Introduced self to %v", pi)
-	delete(d.pendingIntroductions, pi)
+	pd.ctx.Logger.Info("Introduced self to %v", pi)
+	delete(pd.pendingIntroductions, pi)
 }

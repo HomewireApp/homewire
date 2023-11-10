@@ -5,7 +5,6 @@ import (
 	"io"
 	"time"
 
-	"github.com/HomewireApp/homewire/internal/logger"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -38,7 +37,6 @@ func SendMessageToPeer(conn *network.Conn, msg *PlainOutboundMessage) error {
 
 	bytes, err := msg.Marshal()
 	if err != nil {
-		logger.Warn("Failed to encode message due to %v", err)
 		str.Reset()
 		return nil
 	}
@@ -46,8 +44,6 @@ func SendMessageToPeer(conn *network.Conn, msg *PlainOutboundMessage) error {
 	defer str.Close()
 
 	str.Write(bytes)
-	logger.Debug("Sent message to %v", msg.GetRecipient())
-
 	return nil
 }
 
@@ -87,18 +83,14 @@ func AttachListener(h host.Host, listener MessageReceiver) {
 }
 
 func prepareMessageStream(conn *network.Conn, msg OutboundMessage) (network.Stream, error) {
-	pi := msg.GetRecipient()
-
 	str, err := (*conn).NewStream(context.Background())
 	if err != nil {
-		logger.Warn("Failed to open stream to peer %v, introduction will be retried later %v", pi, err)
 		return nil, tracerr.Wrap(err)
 	}
 
 	timeout := msg.GetTimeout()
 	if timeout != nil {
 		if err := str.SetDeadline(time.Now().Add(*timeout)); err != nil {
-			logger.Warn("Failed to set timeout for identification stream due to %v", err)
 			str.Reset()
 			return nil, tracerr.Wrap(err)
 		}
@@ -106,19 +98,16 @@ func prepareMessageStream(conn *network.Conn, msg OutboundMessage) (network.Stre
 
 	pid := msg.GetProtocolID()
 	if err := str.SetProtocol(pid); err != nil {
-		logger.Warn("Failed to set protocol ID for peer stream due to %v", err)
 		str.Reset()
 		return nil, tracerr.Wrap(err)
 	}
 
 	if err := msmux.SelectProtoOrFail(pid, str); err != nil {
-		logger.Warn("Failed to select protocol due to %v", err)
 		str.Reset()
 		return nil, tracerr.Wrap(err)
 	}
 
 	if err := str.Scope().SetService(msg.GetServiceName()); err != nil {
-		logger.Warn("Failed to set service ID for the identification stream due to %v", err)
 		str.Reset()
 		return nil, tracerr.Wrap(err)
 	}
