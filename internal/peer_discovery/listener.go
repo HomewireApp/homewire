@@ -67,11 +67,20 @@ func (l *introductionMessageListener) HandleMessage(bytes []byte, pi p2ppeer.ID)
 		return
 	}
 
+	knownWires := make([]*peer.PeerWire, 0, len(id.Wires))
+	for _, w := range id.Wires {
+		knownWires = append(knownWires, &peer.PeerWire{
+			Id:   w.Id,
+			Name: w.Name,
+		})
+	}
+
 	wirePeer := &peer.Peer{
 		PeerId:        pi,
 		Id:            id.Id,
 		DisplayedName: id.DisplayedName,
 		PubKey:        pubKey,
+		KnownWires:    knownWires,
 	}
 
 	l.pd.knownPeers[wirePeer.PeerId] = wirePeer

@@ -10,6 +10,12 @@ type Self struct {
 	Id            string
 	DisplayedName string
 	PrivKey       crypto.PrivKey
+	KnownWires    []*PeerWire
+}
+
+type PeerWire struct {
+	Id   string
+	Name string
 }
 
 type Peer struct {
@@ -17,6 +23,7 @@ type Peer struct {
 	Id            string
 	DisplayedName string
 	PubKey        crypto.PubKey
+	KnownWires    []*PeerWire
 }
 
 func (s *Self) GetPublicKey() crypto.PubKey {

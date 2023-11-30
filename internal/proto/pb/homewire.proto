@@ -19,6 +19,7 @@ message Introduction {
   string id = 1;
   string displayedName = 2;
   bytes publicKey = 3;
+  repeated BasicWireInfo wires = 4;
 }
 
 message BasicWireInfo {

@@ -7,10 +7,18 @@ import (
 	"github.com/ztrue/tracerr"
 )
 
-func Introduction(s *peer.Self) (*pb.Envelope, error) {
+func Introduction(s *peer.Self, peerWires []*peer.PeerWire) (*pb.Envelope, error) {
 	pubKeyBytes, err := s.GetPublicKey().Raw()
 	if err != nil {
 		return nil, tracerr.Wrap(err)
+	}
+
+	wires := make([]*pb.BasicWireInfo, 0, len(peerWires))
+	for _, w := range peerWires {
+		wires = append(wires, &pb.BasicWireInfo{
+			Id:   w.Id,
+			Name: w.Name,
+		})
 	}
 
 	return &pb.Envelope{
@@ -19,6 +27,7 @@ func Introduction(s *peer.Self) (*pb.Envelope, error) {
 				Id:            s.Id,
 				DisplayedName: s.DisplayedName,
 				PublicKey:     pubKeyBytes,
+				Wires:         wires,
 			},
 		},
 	}, nil

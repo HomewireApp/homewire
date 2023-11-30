@@ -136,46 +136,8 @@ func InitWithOptions(opts options.Options) (*Homewire, error) {
 	}
 
 	go hw.wireDiscoveryLoop()
-
-	go func() {
-		wireInfo := make([]*pb.BasicWireInfo, 0, len(knownWireModels))
-		for _, m := range knownWireModels {
-			wireInfo = append(wireInfo, &pb.BasicWireInfo{
-				Id:   m.Id,
-				Name: m.Name,
-			})
-		}
-
-		msg := &pb.Envelope{
-			Payload: &pb.Envelope_WireList{
-				WireList: &pb.WireList{
-					Wires: wireInfo,
-				},
-			},
-		}
-
-		timer := time.NewTimer(3 * time.Second)
-		go func() {
-			for {
-				<-timer.C
-
-				bytes, err := proto.MarshalPlain(msg)
-				if err != nil {
-					ctx.Logger.Warn("[homewire:open] Failed to marshal initial announcement message %v", err)
-					timer.Reset(3 * time.Second)
-					continue
-				}
-
-				if err := topic.Publish(hw.Context.Context, bytes); err != nil {
-					ctx.Logger.Warn("[homewire:open] Failed to publish initial announcement message %v", err)
-					timer.Reset(3 * time.Second)
-					continue
-				}
-
-				ctx.Logger.Debug("[homewire:open] Successfully announced %v initial wires", len(wireInfo))
-			}
-		}()
-	}()
+	go hw.peerDiscoveryLoop()
+	go hw.peerConnectednessLoop()
 
 	return hw, nil
 }
@@ -188,6 +150,44 @@ func Init() (*Homewire, error) {
 	}
 
 	return InitWithOptions(*opts)
+}
+
+func (hw *Homewire) peerDiscoveryLoop() {
+	for {
+		peer := <-hw.peerDiscovery.PeersFound
+
+		hw.mutWires.Lock()
+
+		for _, w := range peer.KnownWires {
+			exists := hw.wires[w.Id] == nil
+
+			if !exists {
+				w := wire.CreateUnknownWire(hw.Context, w.Id, w.Name)
+				hw.wires[w.Id] = w
+			}
+
+			hw.wires[w.Id].AddKnownProviderPeer(peer.PeerId)
+
+			if !exists {
+				go hw.afterWireFound(hw.wires[w.Id])
+			}
+		}
+
+		hw.Context.Logger.Debug("[homewire:peerDiscoveryLoop] Got %d wires from new peer", len(peer.KnownWires))
+
+		hw.mutWires.Unlock()
+	}
+}
+
+func (hw *Homewire) peerConnectednessLoop() {
+	for {
+		peer := <-hw.peerDiscovery.PeersLost
+		hw.mutWires.RLock()
+
+		for _, w := range hw.wires {
+			w.RemoveKnownProviderPeer(peer.PeerId)
+		}
+	}
 }
 
 func (hw *Homewire) wireDiscoveryLoop() {
@@ -239,6 +239,8 @@ func (hw *Homewire) wireDiscoveryLoop() {
 				w := wire.CreateUnknownWire(hw.Context, ann.Id, ann.Name)
 				hw.wires[ann.Id] = w
 				go hw.afterWireFound(w)
+
+				w.AddKnownProviderPeer(msg.ReceivedFrom)
 
 				saved = true
 			}

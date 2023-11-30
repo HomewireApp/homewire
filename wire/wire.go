@@ -11,6 +11,7 @@ import (
 	"github.com/HomewireApp/homewire/internal/utils"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pquerna/otp"
 	"github.com/ztrue/tracerr"
 )
@@ -25,6 +26,7 @@ type ConnectionStatus string
 
 type OnJoinStatusChangedHandler func(new JoinStatus, old JoinStatus)
 type OnConnectionStatusChangedHandler func(new ConnectionStatus, old ConnectionStatus)
+type OnProviderCountChangedHandler func(new int, old int)
 
 const (
 	NotJoined  JoinStatus = "not-joined"
@@ -43,13 +45,16 @@ const (
 type Wire struct {
 	ctx *ctx.Context
 
-	Id               string
-	Name             string
-	JoinStatus       JoinStatus
-	ConnectionStatus ConnectionStatus
+	Id                 string
+	Name               string
+	JoinStatus         JoinStatus
+	ConnectionStatus   ConnectionStatus
+	KnownProviderPeers map[peer.ID]struct{}
 
 	privKey crypto.PrivKey
 	otpKey  *otp.Key
+
+	mutProviders *sync.RWMutex
 
 	topic   *pubsub.Topic
 	subs    *pubsub.Subscription
@@ -57,6 +62,7 @@ type Wire struct {
 
 	joinStatusChangedHandlers       []OnJoinStatusChangedHandler
 	connectionStatusChangedHandlers []OnConnectionStatusChangedHandler
+	providerCountChangedHandlers    []OnProviderCountChangedHandler
 	mutHooks                        *sync.Mutex
 }
 
@@ -156,15 +162,21 @@ func CreateExistingKnownWire(ctx *ctx.Context, wireModel *database.WireModel) (*
 	}
 
 	w := &Wire{
-		Id:               wireModel.Id,
-		Name:             wireModel.Name,
-		JoinStatus:       Joined,
-		ConnectionStatus: NotConnected,
-		privKey:          privKey,
-		otpKey:           key,
-		ctx:              ctx,
-		mutConn:          &sync.Mutex{},
-		mutHooks:         &sync.Mutex{},
+		Id:                 wireModel.Id,
+		Name:               wireModel.Name,
+		JoinStatus:         Joined,
+		ConnectionStatus:   NotConnected,
+		KnownProviderPeers: make(map[peer.ID]struct{}),
+
+		joinStatusChangedHandlers:       make([]OnJoinStatusChangedHandler, 0),
+		connectionStatusChangedHandlers: make([]OnConnectionStatusChangedHandler, 0),
+		providerCountChangedHandlers:    make([]OnProviderCountChangedHandler, 0),
+		privKey:                         privKey,
+		otpKey:                          key,
+		ctx:                             ctx,
+		mutConn:                         &sync.Mutex{},
+		mutHooks:                        &sync.Mutex{},
+		mutProviders:                    &sync.RWMutex{},
 	}
 
 	go w.ensureConnected()
@@ -202,15 +214,21 @@ func CreateNewKnownWire(ctx *ctx.Context, name string) (*Wire, error) {
 	}
 
 	w := &Wire{
-		ctx:              ctx,
-		Id:               id,
-		Name:             name,
-		JoinStatus:       Joining,
-		ConnectionStatus: NotConnected,
-		privKey:          privKey,
-		otpKey:           key,
-		mutConn:          &sync.Mutex{},
-		mutHooks:         &sync.Mutex{},
+		ctx:                ctx,
+		Id:                 id,
+		Name:               name,
+		JoinStatus:         Joining,
+		ConnectionStatus:   NotConnected,
+		KnownProviderPeers: make(map[peer.ID]struct{}),
+
+		joinStatusChangedHandlers:       make([]OnJoinStatusChangedHandler, 0),
+		connectionStatusChangedHandlers: make([]OnConnectionStatusChangedHandler, 0),
+		providerCountChangedHandlers:    make([]OnProviderCountChangedHandler, 0),
+		privKey:                         privKey,
+		otpKey:                          key,
+		mutConn:                         &sync.Mutex{},
+		mutHooks:                        &sync.Mutex{},
+		mutProviders:                    &sync.RWMutex{},
 	}
 
 	go w.ensureConnected()
@@ -220,13 +238,19 @@ func CreateNewKnownWire(ctx *ctx.Context, name string) (*Wire, error) {
 
 func CreateUnknownWire(ctx *ctx.Context, id string, name string) *Wire {
 	return &Wire{
-		ctx:              ctx,
-		Id:               id,
-		Name:             name,
-		JoinStatus:       NotJoined,
-		ConnectionStatus: NotConnected,
-		mutConn:          &sync.Mutex{},
-		mutHooks:         &sync.Mutex{},
+		ctx:                ctx,
+		Id:                 id,
+		Name:               name,
+		JoinStatus:         NotJoined,
+		ConnectionStatus:   NotConnected,
+		KnownProviderPeers: make(map[peer.ID]struct{}),
+
+		joinStatusChangedHandlers:       make([]OnJoinStatusChangedHandler, 0),
+		connectionStatusChangedHandlers: make([]OnConnectionStatusChangedHandler, 0),
+		providerCountChangedHandlers:    make([]OnProviderCountChangedHandler, 0),
+		mutConn:                         &sync.Mutex{},
+		mutHooks:                        &sync.Mutex{},
+		mutProviders:                    &sync.RWMutex{},
 	}
 }
 
@@ -277,6 +301,26 @@ func (w *Wire) GenerateOtp() (*WireOtp, error) {
 	}, nil
 }
 
+func (w *Wire) AddKnownProviderPeer(pid peer.ID) {
+	w.mutProviders.Lock()
+	defer w.mutProviders.Unlock()
+
+	if _, ok := w.KnownProviderPeers[pid]; !ok {
+		w.KnownProviderPeers[pid] = struct{}{}
+		w.ctx.Logger.Debug("[wire:AddKnownProviderPeer] [%s] Added new known provider peer %v", w.Id, pid)
+	}
+}
+
+func (w *Wire) RemoveKnownProviderPeer(pid peer.ID) {
+	w.mutProviders.Lock()
+	defer w.mutProviders.Unlock()
+
+	if _, ok := w.KnownProviderPeers[pid]; ok {
+		delete(w.KnownProviderPeers, pid)
+		w.ctx.Logger.Debug("[wire:RemoveKnownProviderPeer] [%s] Removed known provider peer %v", w.Id, pid)
+	}
+}
+
 func (w *Wire) OnJoinStatusChanged(handler OnJoinStatusChangedHandler) {
 	w.mutHooks.Lock()
 	defer w.mutHooks.Unlock()
@@ -287,6 +331,12 @@ func (w *Wire) OnConnectionStatusChanged(handler OnConnectionStatusChangedHandle
 	w.mutHooks.Lock()
 	defer w.mutHooks.Unlock()
 	w.connectionStatusChangedHandlers = append(w.connectionStatusChangedHandlers, handler)
+}
+
+func (w *Wire) OnProviderCountChanged(handler OnProviderCountChangedHandler) {
+	w.mutHooks.Lock()
+	defer w.mutHooks.Unlock()
+	w.providerCountChangedHandlers = append(w.providerCountChangedHandlers, handler)
 }
 
 func (w *Wire) Destroy() {

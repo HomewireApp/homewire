@@ -8,6 +8,7 @@ import (
 	"github.com/HomewireApp/homewire/internal/proto/messages"
 	"github.com/HomewireApp/homewire/peer"
 	"github.com/libp2p/go-libp2p/core/host"
+	p2pnet "github.com/libp2p/go-libp2p/core/network"
 	p2ppeer "github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
@@ -17,8 +18,11 @@ import (
 const mdnsServiceTag = "homewire:mdns:discovery"
 const discoveryProtocolId = protocol.ID("/homewire/id/1.0.0")
 
+const connectednessLoopInterval = 5 * time.Second
+
 type PeerDiscovery struct {
 	PeersFound chan *peer.Peer
+	PeersLost  chan *peer.Peer
 
 	self *peer.Self
 	ctx  *context.Context
@@ -26,7 +30,7 @@ type PeerDiscovery struct {
 
 	pendingIntroductions map[p2ppeer.ID]bool
 	knownPeers           map[p2ppeer.ID]*peer.Peer
-	introductionTicker   *time.Ticker
+	connectednessTimer   *time.Timer
 
 	identityListener *introductionMessageListener
 
@@ -52,12 +56,13 @@ func (dn *discoveryNotifee) HandlePeerFound(pi p2ppeer.AddrInfo) {
 func Init(ctx *context.Context, h host.Host, self *peer.Self) (*PeerDiscovery, error) {
 	disc := &PeerDiscovery{
 		PeersFound:           make(chan *peer.Peer, 16),
+		PeersLost:            make(chan *peer.Peer, 16),
 		self:                 self,
 		ctx:                  ctx,
 		host:                 h,
 		pendingIntroductions: make(map[p2ppeer.ID]bool),
 		knownPeers:           make(map[p2ppeer.ID]*peer.Peer),
-		introductionTicker:   time.NewTicker(5 * time.Second),
+		connectednessTimer:   time.NewTimer(connectednessLoopInterval),
 		// destroySignal:        make(chan bool, 1),
 		// svcCloseSignal:       make(chan bool, 1),
 	}
@@ -77,7 +82,7 @@ func Init(ctx *context.Context, h host.Host, self *peer.Self) (*PeerDiscovery, e
 	// 	result.svcCloseSignal <- true
 	// }()
 
-	go disc.introductionLoop()
+	go disc.connectednessLoop()
 
 	return disc, nil
 }
@@ -87,14 +92,35 @@ func (pd *PeerDiscovery) GetKnownPeer(id p2ppeer.ID) *peer.Peer {
 }
 
 func (pd *PeerDiscovery) Destroy() {
-	pd.introductionTicker.Stop()
+	pd.connectednessTimer.Stop()
 	// d.destroySignal <- true
 	// <-d.svcCloseSignal
 }
 
-func (pd *PeerDiscovery) introductionLoop() {
+func (pd *PeerDiscovery) connectednessLoop() {
 	for {
-		<-pd.introductionTicker.C
+		<-pd.connectednessTimer.C
+
+		for _, p := range pd.host.Peerstore().Peers() {
+			if p == pd.self.PeerId {
+				continue
+			}
+
+			peer := pd.knownPeers[p]
+			if peer == nil {
+				continue
+			}
+
+			state := pd.host.Network().Connectedness(p)
+
+			if state == p2pnet.Connected || state == p2pnet.CanConnect {
+				continue
+			}
+
+			pd.ctx.Logger.Debug("[peer_discovery:connectednessLoop] Lost connection to peer %v", p)
+			delete(pd.knownPeers, p)
+			go func() { pd.PeersLost <- peer }()
+		}
 
 		for pi, isPending := range pd.pendingIntroductions {
 			if isPending {
@@ -103,6 +129,8 @@ func (pd *PeerDiscovery) introductionLoop() {
 
 			go pd.introduceSelfToPeer(pi)
 		}
+
+		pd.connectednessTimer.Reset(connectednessLoopInterval)
 	}
 }
 
@@ -114,10 +142,25 @@ func (pd *PeerDiscovery) introduceSelfToPeer(pi p2ppeer.ID) {
 
 	pd.pendingIntroductions[pi] = true
 
-	envelope, err := messages.Introduction(pd.self)
+	wires, err := pd.ctx.DB.FindAllWires()
 	if err != nil {
-		pd.ctx.Logger.Warn("Failed to marshal identity message due to %v", err)
-		pd.pendingIntroductions[pi] = true
+		pd.ctx.Logger.Warn("[peer_discovery:introduceSelfToPeer] Failed to load list of wires from database %v", err)
+		pd.pendingIntroductions[pi] = false
+		return
+	}
+
+	peerWires := make([]*peer.PeerWire, 0, len(wires))
+	for _, w := range wires {
+		peerWires = append(peerWires, &peer.PeerWire{
+			Id:   w.Id,
+			Name: w.Name,
+		})
+	}
+
+	envelope, err := messages.Introduction(pd.self, peerWires)
+	if err != nil {
+		pd.ctx.Logger.Warn("[peer_discovery:introduceSelfToPeer] Failed to marshal identity message due to %v", err)
+		pd.pendingIntroductions[pi] = false
 		return
 	}
 
@@ -130,11 +173,11 @@ func (pd *PeerDiscovery) introduceSelfToPeer(pi p2ppeer.ID) {
 
 	err = network.SendMessageToPeer(conn, msg)
 	if err != nil {
-		pd.ctx.Logger.Warn("Failed to send identity message to peer %v due to %v", pi, err)
+		pd.ctx.Logger.Warn("[peer_discovery:introduceSelfToPeer] Failed to send identity message to peer %v due to %v", pi, err)
 		pd.pendingIntroductions[pi] = false
 		return
 	}
 
-	pd.ctx.Logger.Info("Introduced self to %v", pi)
+	pd.ctx.Logger.Debug("[peer_discovery:introduceSelfToPeer] Introduced self to %v", pi)
 	delete(pd.pendingIntroductions, pi)
 }
